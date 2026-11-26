@@ -4523,7 +4523,18 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// A call to one of Claude Code's own tools (WebSearch) is run by Claude
 	// Code, not the client: its block is left out, and the message it ends
 	// goes on in the next one, so the client hears one reply.
-	own := map[int]bool{} // this message's blocks that are such calls
+	own := map[int]bool{}               // this message's blocks that are such calls
+	unalias := map[int]*aliasRewriter{} // the client's calls of this message whose arguments stream
+	// flushArgs hands on what those calls hold back, in their order, while
+	// the call still owns the output: before another block starts, as the
+	// message ends or is cut, and when the output ends
+	flushArgs := func() {
+		for _, i := range slices.Sorted(maps.Keys(unalias)) {
+			if rest := unalias[i].flush(); rest != "" {
+				r.emit(Event{Kind: KToolArgs, Text: rest})
+			}
+		}
+	}
 	// With a schema the answer is what Claude Code's StructuredOutput call
 	// gave once Claude Code took it as fitting: its result's
 	// structured_output. A call that doesn't fit is told so and made again,
@@ -4691,6 +4702,8 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// after Claude Code's own call or an attempt cut short
 	begin := func(id, model string, u cliUsage) {
 		own, theirs, stopped, shown = map[int]bool{}, false, false, false
+		flushArgs()
+		clear(unalias)
 		if inside || cut {
 			inside, cut, refused, refusedDetails = false, false, false, nil
 			before, this = before.plus(this, false), Usage{}
@@ -4769,7 +4782,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				log.Printf("claude: Claude Code called %s before writing its message; the call is the reply", name)
 				r.emit(Event{Kind: KToolStart, ID: id, Name: name})
 				if len(args) > 0 {
-					r.emit(Event{Kind: KToolArgs, Text: string(args)})
+					r.emit(Event{Kind: KToolArgs, Text: unaliasArgs(r.aliases(), args)})
 				}
 				end("tool_use")
 				if !inside {
@@ -4980,6 +4993,10 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			waiting := r.schema && inside
 			standing := refused
 			inside, refused = false, false
+			// the turn's calls are over: what they held back goes before
+			// its error, while the reply still has them
+			flushArgs()
+			clear(unalias)
 			switch {
 			case standing && envelope.APIErrorStatus == 0:
 				// nothing came after the refusal: with no model left to
@@ -5116,7 +5133,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 					told[c.ID] = true
 					r.emit(Event{Kind: KToolStart, ID: c.ID, Name: name})
 					if len(c.Input) > 0 {
-						r.emit(Event{Kind: KToolArgs, Text: string(c.Input)})
+						r.emit(Event{Kind: KToolArgs, Text: unaliasArgs(r.aliases(), c.Input)})
 					}
 				}
 			}
@@ -5158,11 +5175,13 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			r.replyBegun(e.Message.ID)
 			begin(e.Message.ID, e.Message.Model, e.Message.Usage)
 		case "content_block_start":
+			flushArgs()
 			switch e.ContentBlock.Type {
 			case "tool_use":
 				if name, theirs := toolStart(e.Index, e.ContentBlock.Name); theirs {
 					// shown, its call doesn't tell it again (onCall)
 					told[e.ContentBlock.ID] = true
+					unalias[e.Index] = newAliasRewriter(r.aliases())
 					r.emit(Event{Kind: KToolStart, ID: e.ContentBlock.ID, Name: name})
 				}
 			case "text":
@@ -5189,17 +5208,33 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			case "signature_delta":
 				r.emit(Event{Kind: KSig, Name: sealAnthropic, Text: e.Delta.Signature})
 			case "input_json_delta":
-				if !own[e.Index] {
-					r.emit(Event{Kind: KToolArgs, Text: e.Delta.PartialJSON})
+				if own[e.Index] {
+					break
+				}
+				text := e.Delta.PartialJSON
+				if w := unalias[e.Index]; w != nil {
+					text = w.write(text)
+				}
+				if text != "" || e.Delta.PartialJSON == "" {
+					r.emit(Event{Kind: KToolArgs, Text: text})
+				}
+			}
+		case "content_block_stop":
+			if w := unalias[e.Index]; w != nil {
+				delete(unalias, e.Index)
+				if rest := w.flush(); rest != "" {
+					r.emit(Event{Kind: KToolArgs, Text: rest})
 				}
 			}
 		case "message_delta":
+			flushArgs()
 			r.emit(Event{Kind: KUsage, Usage: usage(e.Usage), RequestID: reqID, SafeguardResults: e.Delta.SafeguardResults, StopDetails: heldIfRefused(e.Delta.StopReason, e.Delta.StopDetails)})
 			if e.Delta.StopReason != "" {
 				stopped = true
 			}
 			end(e.Delta.StopReason)
 		case "message_stop":
+			flushArgs()
 			switch {
 			case inside:
 			case !stopped && shown:
@@ -5222,6 +5257,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	pmu.Lock()
 	defer pmu.Unlock()
 	over = true
+	flushArgs()
 	settle()
 	if err := s.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
 		r.emit(Event{Kind: KError, Text: err.Error()})

@@ -107,6 +107,28 @@ stay apart), the same in every run, so a resumed session, the history
 run was offered it. `subscriptionRun.names` (`bridgeNames`) maps it back
 to the declared name in `toolStart`, for streamed and whole messages, and
 in `mcpCall` (#2649).
+A tool name inside another call's arguments (a batch's items, a router's
+`call_tool`, a subagent's tool list) is written by the model with the
+alias, the only name it was shown, and the client knows no such tool
+(#5840). Every JSON string in a call's arguments that is exactly an alias
+(`toolAliases`: `bridgeName` of each tool the run was told of, unless that
+alias is a declared tool itself or the tool is magpie's own web search,
+answer or advisor tool) is handed on as the declared name, keys
+included, on all three ways a call reaches the client: the `onCall` early
+tell and a whole message's `input` (`unaliasArgs`), and the streamed
+`input_json_delta` fragments (`aliasRewriter`, one per block). What a
+block holds back is handed on at its `content_block_stop`, and in block
+order (`flushArgs`) before any other block starts, as the message ends or
+is cut, before a failed turn's error `result`, and when the output ends,
+so a call's bytes are told before the next block's and none is lost.
+Anthropic's stream tells blocks one after another; a block going on after
+another began would have its later fragments told as the newer call's,
+as before this rewrite, and unrewritten. The stream holds back only a string that may still
+become an alias, at most the longest one, so arguments keep streaming; a
+string that merely contains an alias (a grep pattern, a pasted log line)
+or spells it with a JSON escape is left as it came. The tool list, the
+history and the tool choice still show the alias: the descriptions are
+unchanged, so the prompt's cached prefix is too.
 Each tool's input schema is folded to an object root (`objectSchema`,
 `provider.ObjectRoot`), as a Messages request magpie builds is: Claude
 Code leaves out an MCP tool whose `inputSchema` has a `oneOf`, `anyOf` or
